@@ -26,9 +26,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "threads.h"
 
+#include "encoderstate.h"
 
 /**
  * \file
@@ -209,6 +211,18 @@ struct threadqueue_queue_t {
    * \brief Pointer to the last ready job
    */
   threadqueue_job_t *last;
+
+  /**
+  * \brief Number of active threads
+  */
+  int thread_active;
+
+  /**
+  * \brief Maximum Number of active threads
+  */
+  int thread_max_active;
+  //End Rafa
+
 };
 
 
@@ -267,9 +281,12 @@ static void* threadqueue_worker(void* threadqueue_opaque)
   PTHREAD_LOCK(&threadqueue->lock);
 
   for (;;) {
-    while (!threadqueue->stop && threadqueue->first == NULL) {
+    while ( (!threadqueue->stop && threadqueue->first == NULL) || 
+              threadqueue->thread_active > threadqueue->thread_max_active) {
+      threadqueue->thread_active--;
       // Wait until there is something to do in the queue.
       PTHREAD_COND_WAIT(&threadqueue->job_available, &threadqueue->lock);
+      threadqueue->thread_active++;
     }
 
     if (threadqueue->stop) {
@@ -322,13 +339,42 @@ static void* threadqueue_worker(void* threadqueue_opaque)
     job->rdepends_count = 0;
 
     PTHREAD_UNLOCK(&job->lock);
+
+    const lcu_order_element_t * const lcu = job->arg;
+    encoder_state_t *state = lcu->encoder_state;
+
+    printf("Thread %d\tCTU: %d %d\t%d\tdeps %d (%d)\n", 
+      (int)pthread_self(), lcu->position.y, lcu->position.x, 
+      state->frame->poc, job->rdepends_count, num_new_jobs);
+
+    if (lcu->position.y == 4 && lcu->position.x == 0)
+    {
+      threadqueue->thread_max_active++;
+      printf("Add thread\n");  
+    }
+
     kvz_threadqueue_free_job(&job);
 
     // The current thread will process one of the new jobs so we wake up
     // one threads less than the the number of new jobs.
-    for (int i = 0; i < num_new_jobs - 1; i++) {
+    // for (int i = 0; i < num_new_jobs - 1; i++) {
+    //   pthread_cond_signal(&threadqueue->job_available);
+
+
+    int add_threads = fmin(threadqueue->thread_max_active - threadqueue->thread_active, 
+							num_new_jobs - 1);
+    for (int i = 0; i < add_threads;i++) {
       pthread_cond_signal(&threadqueue->job_available);
+      //threadqueue->thread_active++;
+      printf("One more active thread\n");
     }
+
+    /*for (int i = 0; i < threadqueue->thread_max_active - threadqueue->thread_active; i++)
+    {
+      pthread_cond_signal(&threadqueue->job_available);
+      printf("One more active thread (if available tasks)\n");
+    }*/
+
   }
 
   threadqueue->thread_running_count--;
@@ -387,6 +433,10 @@ threadqueue_queue_t * kvz_threadqueue_init(int thread_count)
     threadqueue->thread_count++;
     threadqueue->thread_running_count++;
   }
+
+  threadqueue->thread_active = threadqueue->thread_running_count;
+  threadqueue->thread_max_active = 2;
+
   PTHREAD_UNLOCK(&threadqueue->lock);
 
   return threadqueue;
@@ -443,7 +493,12 @@ int kvz_threadqueue_submit(threadqueue_queue_t * const threadqueue, threadqueue_
     job->state = THREADQUEUE_JOB_STATE_DONE;
   } else if (job->ndepends == 0) {
     threadqueue_push_job(threadqueue, kvz_threadqueue_copy_ref(job));
-    pthread_cond_signal(&threadqueue->job_available);
+
+    if (threadqueue->first->next == NULL) // It was empty
+    {
+      pthread_cond_signal(&threadqueue->job_available);
+    } 
+
   } else {
     job->state = THREADQUEUE_JOB_STATE_WAITING;
   }
